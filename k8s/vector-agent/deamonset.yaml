@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector-agent
+  namespace: logging
+  labels:
+    app: vector-agent
+spec:
+  selector:
+    matchLabels:
+      app: vector-agent
+  template:
+    metadata:
+      labels:
+        app: vector-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8686"
+    spec:
+      serviceAccountName: vector-agent
+      
+      # Tolerations для запуска на всех нодах
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      
+      containers:
+        - name: vector
+          image: timberio/vector:0.34.1-alpine
+          args:
+            - --config-dir
+            - /etc/vector/
+          env:
+            - name: OPENSEARCH_USER
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-credentials
+                  key: username
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-credentials
+                  key: password
+            - name: KAFKA_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: username
+            - name: KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: password
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: VECTOR_SELF_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: VECTOR_SELF_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          
+          ports:
+            - name: api
+              containerPort: 8686
+              protocol: TCP
+          
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+            - name: yandex-ca
+              mountPath: /etc/ssl/certs/yandex
+            - name: data
+              mountPath: /vector-data-dir
+            - name: var-log-pods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: var-log-containers
+              mountPath: /var/log/containers
+              readOnly: true
+          
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+        - name: yandex-ca
+          configMap:
+            name: yandex-ca-cert
+        - name: data
+          hostPath:
+            path: /var/lib/vector
+            type: DirectoryOrCreate
+        - name: var-log-pods
+          hostPath:
+            path: /var/log/pods
+        - name: var-log-containers
+          hostPath:
+            path: /var/log/containers
+      
+      terminationGracePeriodSeconds: 60

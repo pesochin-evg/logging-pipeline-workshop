@@ -1,0 +1,65 @@
+replicas: 1
+
+image:
+  repository: grafana/grafana
+  tag: latest
+
+plugins:
+  - grafana-clickhouse-datasource
+
+admin:
+  existingSecret: grafana-admin-secret
+  userKey: admin-user
+  passwordKey: admin-password
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: ClickHouse
+        type: grafana-clickhouse-datasource
+        uid: clickhouse-main
+        access: proxy
+        isDefault: true
+        jsonData:
+          host: rc1a-djgubqvc88jhm554.mdb.yandexcloud.net
+          port: 9440
+          protocol: native
+          secure: true
+          username: datatransfer
+          defaultDatabase: logs
+          defaultTable: logs
+          tlsSkipVerify: true
+          tlsCACert: /etc/ssl/certs/yandex/ca.crt
+        secureJsonData:
+          password: $__file{/etc/secrets/clickhouse/password}
+
+extraSecretMounts:
+  - name: clickhouse-secret
+    secretName: clickhouse-credentials
+    defaultMode: 0440
+    mountPath: /etc/secrets/clickhouse
+    readOnly: true
+
+extraConfigmapMounts:
+  - name: yandex-ca
+    configMap: yandex-ca-cert
+    mountPath: /etc/ssl/certs/yandex
+    readOnly: true
+
+persistence:
+  enabled: false
+
+service:
+  enabled: true
+  type: LoadBalancer
+  port: 80
+  targetPort: 3000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

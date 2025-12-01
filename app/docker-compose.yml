@@ -1,0 +1,11 @@
+services:
+  test-app:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    container_name: logging-test-app
+    restart: unless-stopped
+    platform: linux/amd64
+    # Logs will be output to stdout/stderr and can be collected by Kubernetes

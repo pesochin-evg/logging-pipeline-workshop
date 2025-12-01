@@ -1,0 +1,235 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: logging
+data:
+  vector.yaml: |    # Глобальные настройки
+    data_dir: /vector-data-dir
+  
+    api:
+      enabled: true
+      address: 0.0.0.0:8686
+      playground: false
+
+    sources:
+      kubernetes_logs:
+        type: kubernetes_logs
+        auto_partial_merge: true
+        exclude_paths_glob_patterns:
+          - "**/kube-system/**"
+          - "**/logging/**"
+        annotation_fields:
+          container_image: kubernetes.container_image
+          container_name: kubernetes.container_name
+          pod_ip: kubernetes.pod_ip
+          pod_ips: kubernetes.pod_ips
+          pod_labels: kubernetes.pod_labels
+          pod_name: kubernetes.pod_name
+          pod_namespace: kubernetes.pod_namespace
+          pod_node_name: kubernetes.pod_node_name
+          pod_owner: kubernetes.pod_owner
+          pod_uid: kubernetes.pod_uid
+    
+    transforms:
+      filter_default_namespace:
+        type: filter
+        inputs:
+          - kubernetes_logs
+        condition: |
+          .kubernetes.pod_namespace == "default"
+      remap_build_initial_event:
+        type: remap
+        inputs:
+          - filter_default_namespace
+        source: |
+          . = {
+            "raw": .,
+            "record_id": uuid_v4(),
+            "time": "",
+            "env": "",
+            "level": "",
+            "project": "itmo-workshop",
+            "service": "",
+            "message": "",
+            "hostname": "",
+            "request_id": "",
+            "rest": {
+              "app": {},
+              "k8s": {
+                "zone": "",
+                "node": "",
+                "pod_ips": [],
+              }
+            },
+          }
+      remap_extract_existing_kubernetes_logs_data:
+        type: remap
+        inputs:
+        - remap_build_initial_event
+        source: |
+          .time = parse_timestamp!(.raw.timestamp, format: "%+")
+          .hostname = .raw.kubernetes.pod_name
+
+          .rest.k8s.pod_ips = .raw.kubernetes.pod_ips
+          .rest.k8s.node = .raw.kubernetes.pod_node_name
+
+          
+          if exists(.raw.kubernetes.node_labels."topology.kubernetes.io/zone") {
+            .rest.k8s.zone = .raw.kubernetes.node_labels."topology.kubernetes.io/zone"
+          }
+
+          if exists(.raw.kubernetes.pod_namespace) {
+            .env = .raw.kubernetes.pod_namespace
+          }
+
+          if exists(.raw.kubernetes.pod_labels."app.kubernetes.io/name") {
+            .service = .raw.kubernetes.pod_labels."app.kubernetes.io/name"
+          } else {
+            .service = .raw.kubernetes.container_name
+          }
+      remap_try_to_parse_json_in_message:
+        type: remap
+        inputs:
+        - remap_extract_existing_kubernetes_logs_data
+        source: |
+          .raw.parsed_json = parse_json(.raw.message) ?? {"unparsed": true}
+      filter_only_json_is_parsed:
+        type: filter
+        inputs:
+        - remap_try_to_parse_json_in_message
+        condition: |
+          !exists(.raw.parsed_json.unparsed)
+      remap_extract_level_from_parsed_json:
+        type: remap
+        inputs:
+        - filter_only_json_is_parsed
+        source: |
+          if exists(.raw.parsed_json.level) {
+            .level = .raw.parsed_json.level
+            del(.raw.parsed_json.level)
+          } else if exists(.raw.parsed_json.err) {
+            .level = "ERROR"
+          } else {
+            .level = "UNKNOWN"
+          }
+          .level = upcase(to_string!(.level))
+          if .level == "WARNING" {
+            .level = "WARN"
+          }
+      remap_extract_time_from_parsed_json:
+        type: remap
+        inputs:
+        - remap_extract_level_from_parsed_json
+        source: |
+          time = null
+
+          if exists(.raw.parsed_json.timestamp) {
+            if (is_float(.raw.parsed_json.timestamp)) {
+              is_milise_timestamp = (.raw.parsed_json.timestamp > 3000000000) ?? false
+              if is_milise_timestamp {
+                time, err = parse_timestamp(to_string(.raw.parsed_json.timestamp / 1000.0 ?? 0.0 ), format: "%s.%f")
+                if err != null {
+                  time = null
+                }
+              }
+            }
+            del(.raw.parsed_json.timestamp)
+          }
+
+          if time != null {
+            .time = time
+          }
+      remap_extract_request_id_from_parsed_json:
+        type: remap
+        inputs:
+        - remap_extract_time_from_parsed_json
+        source: |
+          if exists(.raw.parsed_json.request_id) {
+            .request_id = .raw.parsed_json.request_id
+            del(.raw.parsed_json.request_id)
+          }
+      remap_extract_message_from_parsed_json:
+        type: remap
+        inputs:
+        - remap_extract_request_id_from_parsed_json
+        source: |
+          if exists(.raw.parsed_json.message) {
+            .message = .raw.parsed_json.message
+            del(.raw.parsed_json.message)
+          }
+      remap_set_rest_app_json:
+        type: remap
+        inputs:
+          - remap_extract_message_from_parsed_json
+        source: |
+          .rest.app = .raw.parsed_json
+      remap_format_time:
+        # ISO 8601 / RFC 3339 date & time format.
+        type: remap
+        inputs:
+        - remap_set_rest_app_json
+        source: |
+          .time = format_timestamp!(.time, format: "%+")
+      remap_remove_raw:
+        type: remap
+        inputs:
+        - remap_format_time
+        source: |
+          del(.raw)
+    
+    sinks:
+      opensearch:
+        type: elasticsearch
+        inputs:
+          - remap_remove_raw
+        endpoints:
+          - "https://rc1a-4et07ffv5nstg912.mdb.yandexcloud.net:9200"
+        auth:
+          strategy: basic
+          user: "${OPENSEARCH_USER}"
+          password: "${OPENSEARCH_PASSWORD}"
+        suppress_type_name: true  
+        tls:
+          verify_certificate: false
+        bulk:
+          index: "logs-%Y.%m.%d"
+        batch:
+          max_bytes: 10485760  # 10MB
+          max_events: 10000
+          timeout_secs: 5
+        buffer:
+          type: disk
+          max_size: 5368709120  # 5GB
+          when_full: block
+        request:
+          retry_initial_backoff_secs: 1
+          retry_max_duration_secs: 300
+          concurrency: 10
+        
+        healthcheck:
+          enabled: true
+      
+      kafka:
+        type: kafka
+        inputs:
+        - remap_remove_raw
+        bootstrap_servers: "rc1a-gt68qqbodkjmdoii.mdb.yandexcloud.net:9091"
+        key_field: "timestamp"
+        topic: "logs"
+        compression: "snappy"
+        tls:
+          enabled: true
+          ca_file: "/etc/ssl/certs/yandex/ca.crt"
+        sasl:
+          enabled: true
+          mechanism: SCRAM-SHA-512
+          username: "${KAFKA_USER}"
+          password: "${KAFKA_PASSWORD}"
+        encoding:
+          codec: json
+          timestamp_format: rfc3339
+        buffer:
+          type: memory
+          max_events: 15000
+          when_full: drop_newest
